@@ -2,33 +2,37 @@ use std::any::Any;
 use std::mem;
 
 use memflow::prelude::v1::*;
+use memflow_vdm::{PhysicalMemory, *};
 
-use memflow_vdm::{PhysicalMemory, Result, *};
-
-use windows::core::s;
-use windows::Win32::Foundation::{CloseHandle, GENERIC_READ, GENERIC_WRITE, HANDLE};
+use windows::core::{s, Result};
+use windows::Win32::Foundation::{CloseHandle, GENERIC_READ, GENERIC_WRITE};
 use windows::Win32::Storage::FileSystem::{CreateFileA, FILE_ATTRIBUTE_NORMAL, OPEN_EXISTING};
 use windows::Win32::System::IO::DeviceIoControl;
 
+use handle::RawHandle;
+
+mod handle;
+
 #[repr(u32)]
+#[derive(Debug, Clone, Copy)]
 enum IoControlCode {
     MapPhysicalMemory = 0x80102040,
     UnmapPhysicalMemory = 0x80102044,
 }
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 #[repr(C)]
 struct PhysicalMemoryMappingRequest {
     size: u64,
     phys_addr: u64,
-    section_handle: HANDLE,
+    section_handle: RawHandle,
     virt_addr: u64,
-    obj_handle: HANDLE,
+    obj_handle: RawHandle,
 }
 
 #[derive(Clone)]
 struct WinIoDriver {
-    handle: HANDLE,
+    handle: RawHandle,
 }
 
 impl WinIoDriver {
@@ -45,22 +49,27 @@ impl WinIoDriver {
             )?
         };
 
-        Ok(Self { handle })
+        Ok(Self {
+            handle: handle.into(),
+        })
     }
 }
 
 impl Drop for WinIoDriver {
     fn drop(&mut self) {
-        if !self.handle.is_invalid() {
-            unsafe { _ = CloseHandle(self.handle) }
+        if self.handle.is_valid() {
+            unsafe {
+                let _ = CloseHandle(self.handle.handle());
+            }
         }
     }
 }
 
+#[derive(Debug)]
 struct MapPhysicalMemoryResponse {
     phys_addr: u64,
-    obj_handle: HANDLE,
-    section_handle: HANDLE,
+    obj_handle: RawHandle,
+    section_handle: RawHandle,
     size: usize,
     virt_addr: u64,
 }
@@ -88,7 +97,11 @@ impl PhysicalMemoryResponse for MapPhysicalMemoryResponse {
 }
 
 impl PhysicalMemory for WinIoDriver {
-    fn map_phys_mem(&self, addr: u64, size: usize) -> Result<PhysicalMemoryResponseBoxed> {
+    fn map_phys_mem(
+        &self,
+        addr: u64,
+        size: usize,
+    ) -> memflow_vdm::Result<PhysicalMemoryResponseBoxed> {
         let mut req = PhysicalMemoryMappingRequest {
             size: size as _,
             phys_addr: addr,
@@ -97,7 +110,7 @@ impl PhysicalMemory for WinIoDriver {
 
         unsafe {
             DeviceIoControl(
-                self.handle,
+                self.handle.handle(),
                 IoControlCode::MapPhysicalMemory as _,
                 Some(&req as *const _ as *const _),
                 mem::size_of::<PhysicalMemoryMappingRequest>() as _,
@@ -105,7 +118,8 @@ impl PhysicalMemory for WinIoDriver {
                 mem::size_of::<PhysicalMemoryMappingRequest>() as _,
                 None,
                 None,
-            )?;
+            )
+            .map_err(memflow_vdm::Error::Windows)?;
         }
 
         Ok(Box::new(MapPhysicalMemoryResponse {
@@ -117,7 +131,7 @@ impl PhysicalMemory for WinIoDriver {
         }))
     }
 
-    fn unmap_phys_mem(&self, mapping: PhysicalMemoryResponseBoxed) -> Result<()> {
+    fn unmap_phys_mem(&self, mapping: PhysicalMemoryResponseBoxed) -> memflow_vdm::Result<()> {
         let res = mapping
             .as_any()
             .downcast_ref::<MapPhysicalMemoryResponse>()
@@ -132,7 +146,7 @@ impl PhysicalMemory for WinIoDriver {
 
         unsafe {
             DeviceIoControl(
-                self.handle,
+                self.handle.handle(),
                 IoControlCode::UnmapPhysicalMemory as _,
                 Some(&req as *const _ as *const _),
                 mem::size_of::<PhysicalMemoryMappingRequest>() as _,
@@ -150,33 +164,38 @@ impl PhysicalMemory for WinIoDriver {
 pub fn create_connector<'a>(_args: &ConnectorArgs) -> memflow::error::Result<VdmConnector<'a>> {
     let drv = WinIoDriver::open().map_err(|_| {
         Error(ErrorOrigin::Connector, ErrorKind::Uninitialized)
-            .log_error("Unable to open a handle to the WinIo driver")
+            .log_error("unable to open a handle to the winio driver")
     })?;
 
     init_connector(Box::new(drv)).map_err(|_| {
         Error(ErrorOrigin::Connector, ErrorKind::Uninitialized)
-            .log_error("Unable to initialize the VDM connector")
+            .log_error("unable to initialize the vdm connector")
     })
 }
 
-#[test]
-fn map_phys_mem() -> Result<()> {
-    const PAGE_SIZE: usize = 4096;
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    let drv = WinIoDriver::open()?;
+    #[test]
+    fn map_phys_mem() -> memflow_vdm::Result<()> {
+        const PAGE_SIZE: usize = 4096;
 
-    for addr in (0x0..0x10000u64).step_by(PAGE_SIZE) {
-        let mapping = drv.map_phys_mem(addr, PAGE_SIZE)?;
+        let drv = WinIoDriver::open().map_err(memflow_vdm::Error::Windows)?;
 
-        println!(
-            "mapped physical memory from {:#X} -> {:#X} (size: {})",
-            mapping.phys_addr(),
-            mapping.virt_addr(),
-            mapping.size(),
-        );
+        for addr in (0x0..0x10000u64).step_by(PAGE_SIZE) {
+            let mapping = drv.map_phys_mem(addr, PAGE_SIZE)?;
 
-        drv.unmap_phys_mem(mapping)?;
+            println!(
+                "mapped physical memory from {:#X} -> {:#X} (size: {})",
+                mapping.phys_addr(),
+                mapping.virt_addr(),
+                mapping.size(),
+            );
+
+            drv.unmap_phys_mem(mapping)?;
+        }
+
+        Ok(())
     }
-
-    Ok(())
 }
